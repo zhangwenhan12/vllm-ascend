@@ -577,11 +577,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         # TODO: need refactor later, related to vllm PR #34043 this pr delete func
         # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
-        if cudagraph_runtime_mode == CUDAGraphMode.FULL and \
-            self.compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
-            num_reqs_padded = num_reqs
-        else:
-            num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
+        num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
         if num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
@@ -592,10 +588,14 @@ class NPUModelRunner(GPUModelRunner):
                 self.arange_np[1 : num_reqs_padded + 1 - num_reqs] * self.uniform_decode_query_len + last_loc
             )
         else:
-            # Mixed-batch case: num_reqs must equal num_reqs_padded
-            assert num_reqs == num_reqs_padded
-
-            # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
+            if num_reqs_padded > num_reqs:
+                last_loc = self.query_start_loc.np[num_reqs]
+                remaining = num_tokens_padded - last_loc
+                slots = num_reqs_padded + 1 - num_reqs
+                step = 1 if remaining >= slots else 0
+                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1] = (
+                        last_loc + self.arange_np[1:slots] * step
+                )
             self.query_start_loc.np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
 

@@ -307,8 +307,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # Get attn_mask from singleton AttentionMaskBuilder
         attn_mask = self.attn_mask_builder.get_attention_mask(self.model_config)
 
+        graph_padded = int(common_attn_metadata.num_input_tokens or 0) > int(
+                common_attn_metadata.num_actual_tokens or 0
+        )
+
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        if graph_padded:
+            query_start_loc = common_attn_metadata.query_start_loc
+        else:
+            query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         attn_metadata = AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -677,6 +684,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_params = attn_params + (None, None, None, None)  # type: ignore
         graph_params.attn_params[num_tokens].append(attn_params)
 
+        keepalive = getattr(self, "_graph_keepalive", None)
+        if keepalive is None:
+            keepalive = {}
+            self._graph_keepalive = keepalive
+        keepalive.setdefault(num_tokens, []).append(
+                (query, key, value, output, softmax_lse, attn_mask, block_table)
+        )
+
         torch.npu.graph_task_group_begin(stream)
         torch_npu.npu_fused_infer_attention_score.out(
             query=query,
@@ -991,6 +1006,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         _: torch.Tensor,
     ) -> torch.Tensor:
         # use default sparse_mode 0 in normal scenario, which means no mask works on it
+        seq_qlen = attn_metadata.query_start_loc[1:]
         return torch_npu.npu_fusion_attention(
             query=query,
             key=key,
@@ -998,8 +1014,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             head_num=self.num_heads,
             input_layout="TND",
             scale=self.scale,
-            actual_seq_qlen=attn_metadata.actual_seq_lengths_q,
-            actual_seq_kvlen=attn_metadata.actual_seq_lengths_q,
+            actual_seq_qlen=seq_qlen,
+            actual_seq_kvlen=seq_qlen,
         )[0]
 
     def do_kv_cache_update(
